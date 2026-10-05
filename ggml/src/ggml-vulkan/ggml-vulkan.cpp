@@ -2251,6 +2251,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     tc.wg_denoms, spec_fn(tc.warptile, true), tc.align,
                     disable_robustness, rfs, rsgs);
             }
+
+            // track the shader workgroup size for split-K wave accounting
+            vec[i].unaligned->wg_size = tc.warptile[0];
+            if (vec[i].aligned) {
+                vec[i].aligned->wg_size = tc.warptile[0];
+            }
         }
     };
 
@@ -5868,6 +5874,32 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     uint32_t split_k = 1;
+    // Small-N GEMM tiles can leave the CUs idle: a tile whose workgroup is a single
+    // wave gives one short grid (e.g. 160 waves on 140 SIMD32 for M=5120 at n<=32),
+    // and the stock guard refuses to split because n < BN. Count waves per SIMD
+    // rather than workgroups and split-K when the whole grid is below 2 waves/SIMD.
+    static const bool smalln_splitk_disabled = getenv("GGML_VK_DISABLE_SMALLN_SPLITK") != nullptr;
+    if (!smalln_splitk_disabled && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+        ctx->device->shader_core_count != 0 && k >= 2048 && pipeline->wg_size != 0 &&
+        (n < pipeline->wg_denoms[1] || n <= 64)) {
+        const uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
+        const uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
+        const uint32_t waves = m_tiles * n_tiles * CEIL_DIV(pipeline->wg_size, 32u); // wave32 units
+        const uint32_t simds = ctx->device->shader_core_count * 2;
+        if (waves > 0 && waves < 2 * simds) {
+            uint32_t sk = std::min(8u, CEIL_DIV(4 * simds, waves));
+            while (sk > 1) {
+                uint32_t k_split = CEIL_DIV(k, sk);
+                k_split = ROUNDUP_POW2(k_split, 256);
+                if (k_split * (sk - 1) < k) {
+                    break;
+                }
+                sk--;
+            }
+            return std::max(sk, 1u);
+        }
+        return 1;
+    }
     if (ctx->device->shader_core_count != 0 && n >= pipeline->wg_denoms[1]) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
