@@ -331,6 +331,27 @@ bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1
     // Quantized tensor rows are block-aligned when created.
     return ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
 }
+
+// LDS-tiled dim-0 concat for a transposed src1 (nb[1] == element size), as built by
+// GDN/Mamba conv_input: concat(conv_state, transpose(qkv_mixed), 0). The flat concat
+// shader walks src1 with a row-sized lane stride; this variant reads it coalesced.
+static bool ggml_vk_concat_transpose_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) != 0) {
+        return false;
+    }
+    if (ggml_is_quantized(dst->type) || ggml_vk_concat_unit_size(dst->type) != 4) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    // transposed src1: dim-1 stride is one element, dim-0 stride spans a row
+    if (src1->nb[1] != ggml_type_size(src1->type) || src1->nb[0] < (size_t) src1->ne[1] * src1->nb[1]) {
+        return false;
+    }
+    // keep tiny (spec-verify/probe) shapes on the flat path
+    return src1->ne[0] >= 32;
+}
 static bool vk_instance_initialized = false;
 
 vk_instance_t vk_instance;
@@ -3383,6 +3404,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_i32, "concat_transpose_i32", concat_transpose_i32_len, concat_transpose_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
@@ -8693,6 +8715,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
         }
+        if (ggml_vk_concat_transpose_supported(src0, src1, dst) && !getenv("GGML_VK_DISABLE_CONCAT_TRANSPOSE")) {
+            return ctx->device->pipeline_concat_transpose_i32;
+        }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
             return ctx->device->pipeline_concat_i8;
@@ -9657,6 +9682,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             } else if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
                 pipeline == ctx->device->pipeline_cpy_transpose_16) {
                 // 32x32 tiles
+                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
+                elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 32);
+                elements[2] = (uint32_t)(dst->ne[2]*dst->ne[3]);
+                elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+                elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+            } else if (pipeline == ctx->device->pipeline_concat_transpose_i32) {
+                // 32x32 tiles over dims 0 and 1; dims 2 and 3 are the batch
                 elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
                 elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 32);
                 elements[2] = (uint32_t)(dst->ne[2]*dst->ne[3]);

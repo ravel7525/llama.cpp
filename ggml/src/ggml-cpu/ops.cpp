@@ -1912,7 +1912,9 @@ static void ggml_compute_forward_concat_any(
 
     GGML_ASSERT(dim >= 0 && dim < 4);
     GGML_ASSERT(ggml_is_contiguous_rows(src0));
-    GGML_ASSERT(ggml_is_contiguous_rows(src1));
+    // src1 may be a strided (e.g. transposed) view of a contiguous tensor; the row
+    // copy below is then replaced by an element copy for non-block types.
+    GGML_ASSERT(ggml_is_contiguous_rows(src1) || !ggml_is_quantized(src1->type));
 
     int64_t o[4] = {0, 0, 0, 0};
 
@@ -1937,12 +1939,27 @@ static void ggml_compute_forward_concat_any(
     }
 
     // Region 2: copy rows from src1, offset into dst by o[]
-    for (int i3 = 0; i3 < ne13; i3++) {
-        for (int i2 = ith; i2 < ne12; i2 += nth) {
-            for (int i1 = 0; i1 < ne11; i1++) {
-                const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
-                      char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
-                memcpy(y, x, ggml_row_size(src1->type, ne10));
+    if (ggml_is_contiguous_rows(src1)) {
+        for (int i3 = 0; i3 < ne13; i3++) {
+            for (int i2 = ith; i2 < ne12; i2 += nth) {
+                for (int i1 = 0; i1 < ne11; i1++) {
+                    const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
+                          char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
+                    memcpy(y, x, ggml_row_size(src1->type, ne10));
+                }
+            }
+        }
+    } else {
+        const size_t ts = ggml_type_size(src1->type);
+        for (int i3 = 0; i3 < ne13; i3++) {
+            for (int i2 = ith; i2 < ne12; i2 += nth) {
+                for (int i1 = 0; i1 < ne11; i1++) {
+                    for (int i0 = 0; i0 < ne10; i0++) {
+                        const char * x = (const char *) src1->data + i0*nb10 + i1*nb11 + i2*nb12 + i3*nb13;
+                              char * y = (      char *)  dst->data + (i0 + o[0])*nb0 + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3;
+                        memcpy(y, x, ts);
+                    }
+                }
             }
         }
     }
